@@ -30,8 +30,12 @@ reads source files through `/mnt/c`.
 ## Performance Design
 
 - Windows walks and opens source files natively.
-- Traversal uses a bounded worker pool; TAR output remains serial so the stream
-  is valid and memory remains bounded.
+- Traversal uses a bounded worker pool. A second reader pool opens and reads
+  files concurrently, which hides per-file latency on Windows (for example
+  antivirus scanning) and can be several times faster on trees with many small
+  files. Files up to 8 MiB are buffered per reader; larger files fall back to a
+  serial stream.
+- TAR output remains serial so the stream stays valid and memory stays bounded.
 - Include/exclude rules are compiled once and applied before opening files.
 - In update mode, Windows still scans metadata but skips reading, archiving,
   and transmitting unchanged files.
