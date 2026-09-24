@@ -1,0 +1,18 @@
+{
+  "source": "C:\\temp\\winsuck-source",
+  "destination": "/tmp/winsuck-profile-destination",
+  "port": 9099,
+  "workers": 8,
+  "include": [
+    "Models/**/*.xpp",
+    "Models/**/*.xml"
+  ],
+  "exclude": [
+    "**/bin/**",
+    "**/Packages/**",
+    "**/*.dll",
+    "**/*.pdb",
+    "**/*.cache"
+  ],
+  "update": true
+}

@@ -1,0 +1,27 @@
+version: 2
+project_name: winsuck
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: winsuck
+    main: ./cmd/winsuck
+    binary: winsuck
+    goos: [linux, windows]
+    goarch: [amd64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: winsuck
+    ids: [winsuck]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
