@@ -749,6 +749,25 @@ Hvis `winsuck.exe` mangler, er formulaens `resource("windows-sender")` ikke
 installeret korrekt. Hvis filen findes, men ikke kan afvikles, test den direkte
 og kontrollér WSL interoperability som beskrevet i afsnit 7.
 
+### `winsuck pull` fejler med "permission denied" på `winsuck.exe`
+
+Homebrew pakker PE-filen `winsuck.exe` ud uden exec-bit og kører derefter sin
+cleaner, som sætter rettigheden til `0444`. Formulaen løser det med
+`chmod 0755, bin/"winsuck.exe"` i `install` og `skip_clean "bin/winsuck.exe"`,
+så cleaneren ikke nulstiller den. Hvis rettigheden alligevel er forkert:
+
+```bash
+ls -l "$(dirname "$(command -v winsuck)")/winsuck.exe"   # forvent -rwxr-xr-x
+```
+
+Fjern ikke `skip_clean`-linjen ved fremtidige formelopdateringer.
+
+### `brew audit` eller `brew test` fejler under installation af gems
+
+Disse developer-kommandoer bygger native Ruby-extensions og kræver `make` og et
+C-værktøjssæt i WSL. Det er et miljøkrav, ikke en formelfejl. Almindelig
+`brew install` og `winsuck pull` er upåvirket.
+
 ## Hvad du ikke behøver at gøre
 
 - Du behøver ikke installere Go på Windows.
