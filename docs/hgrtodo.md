@@ -9,12 +9,11 @@ kun nødvendig for brugere, der vil køre `winsuck.exe send` direkte fra Windows
 Eksemplerne bruger GitHub-kontoen `bonest`. Udskift den, repositorynavne og
 versioner med de faktiske værdier.
 
-> **Status:** `winsuck --version` og CLI-hjælp findes i koden.
-> Release-infrastrukturen er nu til stede i repoet: `.goreleaser.yaml`,
-> `.github/workflows/release.yml` og `scripts/install.ps1`. Det der mangler, er
-> de eksterne handlinger: oprette GitHub-repoet, pushe tagget og oprette
-> `bonest/homebrew-tap` med `Formula/winsuck.rb`. Udfør afsnittene i rækkefølge
-> og commit ændringerne, før du går videre til næste afsnit.
+> **Status:** Release-pipelinen er sat i drift. `v0.1.0` er publiceret på
+> GitHub med `winsuck_0.1.0_linux_amd64.tar.gz`, `winsuck_0.1.0_windows_amd64.zip`
+> og `checksums.txt`, og `bonest/homebrew-tap` indeholder `Formula/winsuck.rb`.
+> `brew install winsuck` er verificeret i WSL. Afsnittene nedenfor er den
+> generelle opskrift og kan genbruges ved næste release.
 
 ## Før sektion 1: den korte sammenhæng
 
@@ -528,11 +527,15 @@ Installer derefter fra tap'en:
 
 ```bash
 brew tap bonest/tap
+brew trust bonest/tap
 brew install winsuck
 which winsuck
 winsuck --version
 ls -l "$(dirname "$(command -v winsuck)")/winsuck.exe"
 ```
+
+Homebrew 7 afviser utrustede tredjeparts-taps, så `brew trust bonest/tap` er
+nødvendig før installation.
 
 `which winsuck` skal pege ind under din Homebrew-prefix, typisk
 `/home/linuxbrew/.linuxbrew/bin/winsuck`. `ls`-kommandoen skal vise en
@@ -648,6 +651,7 @@ Efter dette setup skal den normale WSL-bruger kun udføre:
 
 ```bash
 brew tap bonest/tap
+brew trust bonest/tap
 brew install winsuck
 winsuck pull 'C:\AOSService\PackagesLocalDirectory' ~/std-cache/fo-metadata
 ```

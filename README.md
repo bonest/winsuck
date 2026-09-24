@@ -10,11 +10,13 @@ On WSL/Linux with Homebrew:
 
 ```bash
 brew tap bonest/tap
+brew trust bonest/tap
 brew install winsuck
 ```
 
-Homebrew installs `winsuck.exe` next to `winsuck`, so `winsuck pull` can start
-the Windows sender through WSL interoperability.
+Homebrew 7 requires third-party taps to be trusted before use. Homebrew installs
+`winsuck.exe` next to `winsuck`, so `winsuck pull` can start the Windows sender
+through WSL interoperability.
 
 For manual Windows use, install `winsuck.exe` from PowerShell:
 
