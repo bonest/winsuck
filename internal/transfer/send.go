@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bonest/winsuck/internal/filter"
+	"github.com/bonest/winsuck/internal/progress"
 )
 
 type SendOptions struct {
@@ -25,6 +27,7 @@ type SendOptions struct {
 	Exclude     []string
 	Update      bool
 	DryRun      bool
+	Progress    progress.Sink
 }
 
 type SendResult struct {
@@ -62,6 +65,9 @@ func Send(options SendOptions) (SendResult, error) {
 	if options.ReadWorkers < 1 {
 		options.ReadWorkers = options.Workers
 	}
+	reporter := progress.NewReporter(options.Progress)
+	reporter.Start()
+
 	ignores, err := filter.ReadIgnore(options.Source)
 	if err != nil {
 		return SendResult{}, err
@@ -72,7 +78,7 @@ func Send(options SendOptions) (SendResult, error) {
 	}
 
 	if options.DryRun {
-		return collect(options.Source, matcher, options.Workers, 0, Manifest{}, false, nil)
+		return collect(options.Source, matcher, options.Workers, 0, Manifest{}, false, nil, reporter)
 	}
 
 	connection, err := net.Dial("tcp", options.Address)
@@ -85,7 +91,7 @@ func Send(options SendOptions) (SendResult, error) {
 		return SendResult{}, err
 	}
 	writer := tar.NewWriter(connection)
-	result, err := collect(options.Source, matcher, options.Workers, options.ReadWorkers, control.Manifest, options.Update && control.Update, writer)
+	result, err := collect(options.Source, matcher, options.Workers, options.ReadWorkers, control.Manifest, options.Update && control.Update, writer, reporter)
 	if err != nil {
 		return result, err
 	}
@@ -95,13 +101,15 @@ func Send(options SendOptions) (SendResult, error) {
 	return result, nil
 }
 
-func collect(root string, matcher *filter.Matcher, workers, readWorkers int, manifest Manifest, update bool, writer *tar.Writer) (SendResult, error) {
+func collect(root string, matcher *filter.Matcher, workers, readWorkers int, manifest Manifest, update bool, writer *tar.Writer, reporter *progress.Reporter) (SendResult, error) {
 	if writer == nil {
-		return scanOnly(root, matcher, workers, manifest, update)
+		return scanOnly(root, matcher, workers, manifest, update, reporter)
 	}
 	if readWorkers < 1 {
 		readWorkers = 1
 	}
+
+	var discoveredFiles, discoveredBytes atomic.Int64
 
 	jobs := make(chan string, workers*2)
 	entries := make(chan sourceEntry, workers*2)
@@ -138,6 +146,13 @@ func collect(root string, matcher *filter.Matcher, workers, readWorkers int, man
 				if !info.Mode().IsRegular() || !matcher.Include(rel) {
 					continue
 				}
+				discoveredFiles.Add(1)
+				discoveredBytes.Add(info.Size())
+				reporter.Report(progress.Event{
+					Phase:     progress.PhaseScanning,
+					FilesDone: discoveredFiles.Load(),
+					BytesDone: discoveredBytes.Load(),
+				})
 				select {
 				case entries <- sourceEntry{path: filename, rel: rel, info: info}:
 				case <-done:
@@ -195,6 +210,11 @@ func collect(root string, matcher *filter.Matcher, workers, readWorkers int, man
 
 	go func() {
 		filterWG.Wait()
+		reporter.ReportNow(progress.Event{
+			Phase:      progress.PhaseTransferring,
+			FilesTotal: discoveredFiles.Load(),
+			BytesTotal: discoveredBytes.Load(),
+		})
 		close(entries)
 	}()
 	go func() {
@@ -203,6 +223,7 @@ func collect(root string, matcher *filter.Matcher, workers, readWorkers int, man
 	}()
 
 	result := SendResult{}
+	var bytesDone int64
 	var firstErr error
 	for payload := range payloads {
 		if payload.err != nil {
@@ -214,6 +235,14 @@ func collect(root string, matcher *filter.Matcher, workers, readWorkers int, man
 		}
 		if payload.skipped {
 			result.Skipped++
+			reporter.Report(progress.Event{
+				Phase:      progress.PhaseTransferring,
+				FilesDone:  result.Files + result.Skipped,
+				BytesDone:  bytesDone,
+				FilesTotal: discoveredFiles.Load(),
+				BytesTotal: discoveredBytes.Load(),
+				Skipped:    result.Skipped,
+			})
 			continue
 		}
 		result.Files++
@@ -221,23 +250,55 @@ func collect(root string, matcher *filter.Matcher, workers, readWorkers int, man
 		if firstErr != nil {
 			continue
 		}
-		if err := writeEntry(writer, payload); err != nil {
+		onBytes := func(n int64) {
+			bytesDone += n
+			reporter.Report(progress.Event{
+				Phase:      progress.PhaseTransferring,
+				FilesDone:  result.Files - 1 + result.Skipped,
+				BytesDone:  bytesDone,
+				FilesTotal: discoveredFiles.Load(),
+				BytesTotal: discoveredBytes.Load(),
+				Skipped:    result.Skipped,
+				Current:    payload.entry.rel,
+			})
+		}
+		if err := writeEntry(writer, payload, onBytes); err != nil {
 			firstErr = err
 			stop()
+			continue
 		}
+		reporter.Report(progress.Event{
+			Phase:      progress.PhaseTransferring,
+			FilesDone:  result.Files + result.Skipped,
+			BytesDone:  bytesDone,
+			FilesTotal: discoveredFiles.Load(),
+			BytesTotal: discoveredBytes.Load(),
+			Skipped:    result.Skipped,
+			Current:    payload.entry.rel,
+		})
 	}
 
 	if err := <-walkDone; err != nil && !errors.Is(err, errStopped) && firstErr == nil {
 		firstErr = fmt.Errorf("walk source: %w", err)
 	}
+	if firstErr == nil {
+		select {
+		case err := <-errs:
+			firstErr = fmt.Errorf("inspect source: %w", err)
+		default:
+		}
+	}
 	if firstErr != nil {
 		return result, firstErr
 	}
-	select {
-	case err := <-errs:
-		return result, fmt.Errorf("inspect source: %w", err)
-	default:
-	}
+	reporter.ReportNow(progress.Event{
+		Phase:      progress.PhaseDone,
+		FilesDone:  result.Files + result.Skipped,
+		BytesDone:  result.Bytes,
+		FilesTotal: discoveredFiles.Load(),
+		BytesTotal: discoveredBytes.Load(),
+		Skipped:    result.Skipped,
+	})
 	return result, nil
 }
 
@@ -264,7 +325,7 @@ func readEntry(entry sourceEntry, manifest Manifest, update bool) filePayload {
 	return filePayload{entry: entry, state: state, data: data}
 }
 
-func writeEntry(writer *tar.Writer, payload filePayload) error {
+func writeEntry(writer *tar.Writer, payload filePayload, onBytes func(int64)) error {
 	header, err := tar.FileInfoHeader(payload.entry.info, "")
 	if err != nil {
 		return fmt.Errorf("create tar header for %q: %w", payload.entry.rel, err)
@@ -274,7 +335,7 @@ func writeEntry(writer *tar.Writer, payload filePayload) error {
 		return fmt.Errorf("write tar header for %q: %w", payload.entry.rel, err)
 	}
 	if payload.large {
-		return streamFile(writer, payload)
+		return streamFile(writer, payload, onBytes)
 	}
 	written, err := writer.Write(payload.data)
 	if err != nil {
@@ -283,15 +344,16 @@ func writeEntry(writer *tar.Writer, payload filePayload) error {
 	if int64(written) != payload.state.Size {
 		return fmt.Errorf("source file changed while reading %q", payload.entry.rel)
 	}
+	onBytes(int64(written))
 	return nil
 }
 
-func streamFile(writer *tar.Writer, payload filePayload) error {
+func streamFile(writer *tar.Writer, payload filePayload, onBytes func(int64)) error {
 	file, err := os.Open(payload.entry.path)
 	if err != nil {
 		return fmt.Errorf("open %q: %w", payload.entry.path, err)
 	}
-	written, copyErr := io.Copy(writer, file)
+	written, copyErr := io.Copy(countingWriter{writer: writer, onWrite: onBytes}, file)
 	closeErr := file.Close()
 	if copyErr != nil {
 		return fmt.Errorf("stream %q: %w", payload.entry.rel, copyErr)
@@ -305,7 +367,9 @@ func streamFile(writer *tar.Writer, payload filePayload) error {
 	return nil
 }
 
-func scanOnly(root string, matcher *filter.Matcher, workers int, manifest Manifest, update bool) (SendResult, error) {
+func scanOnly(root string, matcher *filter.Matcher, workers int, manifest Manifest, update bool, reporter *progress.Reporter) (SendResult, error) {
+	var discoveredFiles, discoveredBytes atomic.Int64
+
 	jobs := make(chan string, workers*2)
 	entries := make(chan sourceEntry, workers*2)
 	errs := make(chan error, 1)
@@ -336,6 +400,13 @@ func scanOnly(root string, matcher *filter.Matcher, workers int, manifest Manife
 				if !info.Mode().IsRegular() || !matcher.Include(rel) {
 					continue
 				}
+				discoveredFiles.Add(1)
+				discoveredBytes.Add(info.Size())
+				reporter.Report(progress.Event{
+					Phase:     progress.PhaseScanning,
+					FilesDone: discoveredFiles.Load(),
+					BytesDone: discoveredBytes.Load(),
+				})
 				entries <- sourceEntry{path: filename, rel: rel, info: info}
 			}
 		}()
@@ -382,15 +453,45 @@ func scanOnly(root string, matcher *filter.Matcher, workers int, manifest Manife
 		result.Files++
 		result.Bytes += state.Size
 	}
+	var scanErr error
 	if err := <-walkDone; err != nil {
-		return result, fmt.Errorf("walk source: %w", err)
+		scanErr = fmt.Errorf("walk source: %w", err)
 	}
-	select {
-	case err := <-errs:
-		return result, fmt.Errorf("inspect source: %w", err)
-	default:
+	if scanErr == nil {
+		select {
+		case err := <-errs:
+			scanErr = fmt.Errorf("inspect source: %w", err)
+		default:
+		}
 	}
+	if scanErr != nil {
+		return result, scanErr
+	}
+	reporter.ReportNow(progress.Event{
+		Phase:      progress.PhaseDone,
+		FilesDone:  result.Files + result.Skipped,
+		BytesDone:  result.Bytes,
+		FilesTotal: discoveredFiles.Load(),
+		BytesTotal: discoveredBytes.Load(),
+		Skipped:    result.Skipped,
+	})
 	return result, nil
+}
+
+// countingWriter forwards writes to an underlying writer while reporting the
+// number of bytes actually written, which keeps progress moving for files that
+// are streamed rather than buffered in memory.
+type countingWriter struct {
+	writer  io.Writer
+	onWrite func(int64)
+}
+
+func (w countingWriter) Write(p []byte) (int, error) {
+	written, err := w.writer.Write(p)
+	if written > 0 && w.onWrite != nil {
+		w.onWrite(int64(written))
+	}
+	return written, err
 }
 
 func fileState(info fs.FileInfo) FileState {

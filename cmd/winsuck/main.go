@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,8 +14,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/bonest/winsuck/internal/config"
+	"github.com/bonest/winsuck/internal/progress"
 	"github.com/bonest/winsuck/internal/transfer"
 )
 
@@ -30,46 +34,70 @@ type cliOptions struct {
 	exclude     []string
 	update      bool
 	dryRun      bool
+	progress    string
 	set         map[string]bool
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "winsuck:", err)
-		writeGeneralHelp(os.Stderr)
-		os.Exit(1)
+	output, err := runWithOutput(os.Args[1:])
+	if err == nil {
+		return
 	}
+	reportError(output, err)
+	os.Exit(1)
+}
+
+// reportError renders a terminal failure. In JSON mode the error is a single
+// event so that every stderr line remains machine-readable; otherwise it uses
+// the human-readable message and help.
+func reportError(output *progressOutput, err error) {
+	if output != nil && output.Enabled() {
+		output.emitError(err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "winsuck:", err)
+	writeGeneralHelp(os.Stderr)
 }
 
 func run(args []string) error {
+	_, err := runWithOutput(args)
+	return err
+}
+
+func runWithOutput(args []string) (*progressOutput, error) {
 	if len(args) == 0 {
 		writeGeneralHelp(os.Stdout)
-		return nil
+		return nil, nil
 	}
 	if args[0] == "--version" {
 		writeVersion(os.Stdout)
-		return nil
+		return nil, nil
 	}
 	if isHelp(args[0]) {
-		return writeRequestedHelp(os.Stdout, args[1:])
+		return nil, writeRequestedHelp(os.Stdout, args[1:])
 	}
 	command := args[0]
 	if len(args) > 1 && isHelp(args[1]) {
-		return writeCommandHelp(os.Stdout, command)
+		return nil, writeCommandHelp(os.Stdout, command)
 	}
 	options, positional, err := parseOptions(command, args[1:])
 	if err != nil {
-		return err
+		return newProgressOutput(requestedProgressFormat(args), os.Stderr), err
 	}
+	format, err := normalizeProgress(options.progress)
+	if err != nil {
+		return newProgressOutput(progressNone, os.Stderr), err
+	}
+	output := newProgressOutput(format, os.Stderr)
 	project, err := resolve(options)
 	if err != nil {
-		return err
+		return output, err
 	}
 
 	switch command {
 	case "pull":
 		if len(positional) > 2 {
-			return errors.New("pull accepts at most <source> <destination>")
+			return output, errors.New("pull accepts at most <source> <destination>")
 		}
 		if len(positional) > 0 {
 			project.Source = positional[0]
@@ -78,41 +106,41 @@ func run(args []string) error {
 			project.Destination = positional[1]
 		}
 		if project.Source == "" || project.Destination == "" {
-			return errors.New("pull requires source and destination")
+			return output, errors.New("pull requires source and destination")
 		}
-		return pull(project, options.dryRun)
+		return output, pull(project, options.dryRun, output)
 	case "listen":
 		if len(positional) > 1 {
-			return errors.New("listen accepts at most <destination>")
+			return output, errors.New("listen accepts at most <destination>")
 		}
 		if len(positional) == 1 {
 			project.Destination = positional[0]
 		}
 		if project.Destination == "" {
-			return errors.New("listen requires destination")
+			return output, errors.New("listen requires destination")
 		}
-		return listen(project)
+		return output, listen(project, output.Sink())
 	case "send":
 		if len(positional) > 1 {
-			return errors.New("send accepts at most <source>")
+			return output, errors.New("send accepts at most <source>")
 		}
 		if len(positional) == 1 {
 			project.Source = positional[0]
 		}
 		if project.Source == "" {
-			return errors.New("send requires source")
+			return output, errors.New("send requires source")
 		}
 		result, err := transfer.Send(transfer.SendOptions{
 			Source: project.Source, Address: address(project), Workers: project.Workers,
 			Include: project.Include, Exclude: project.Exclude, Update: project.Update,
-			DryRun: options.dryRun,
+			DryRun: options.dryRun, Progress: output.Sink(),
 		})
 		if err == nil {
 			fmt.Println(result.String())
 		}
-		return err
+		return output, err
 	default:
-		return fmt.Errorf("unknown command %q", command)
+		return output, fmt.Errorf("unknown command %q", command)
 	}
 }
 
@@ -171,6 +199,7 @@ Options:
   --exclude <glob>      Exclude matching files; repeatable and takes precedence.
   --update              Skip files with unchanged relative path, size, and mtime.
   --dry-run             Scan and report files without transferring.
+  --progress <mode>     Progress output on stderr: none, json, or text (default: none).
 
 CLI scalar options override the profile. CLI include/exclude patterns append to it.
 `)
@@ -187,6 +216,7 @@ Options:
   --host <host>         Listen host (default: 127.0.0.1).
   --port <port>         Loopback TCP port (default: 9099).
   --update              Maintain .winsuck-manifest.json after a successful transfer.
+  --progress <mode>     Progress output on stderr: none, json, or text (default: none).
 `)
 	case "send":
 		fmt.Fprint(output, `Usage:
@@ -204,6 +234,7 @@ Options:
   --exclude <glob>      Exclude matching files; repeatable and takes precedence.
   --update              Use receiver-provided manifest to skip unchanged files.
   --dry-run             Scan and report files without connecting.
+  --progress <mode>     Progress output on stderr: none, json, or text (default: none).
 
 .winsuckignore in the source root adds exclude patterns.
 `)
@@ -216,7 +247,9 @@ Options:
 func parseOptions(command string, args []string) (cliOptions, []string, error) {
 	options := cliOptions{set: map[string]bool{}}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
+	// Errors are rendered by reportError; suppressing the flag package's own
+	// usage output keeps JSON progress mode free of non-event stderr lines.
+	flags.SetOutput(io.Discard)
 	flags.StringVar(&options.configPath, "config", "", "JSON project configuration")
 	flags.Func("src", "source path", setString(&options.source, options.set, "source"))
 	flags.Func("dest", "destination path", setString(&options.destination, options.set, "destination"))
@@ -231,6 +264,7 @@ func parseOptions(command string, args []string) (cliOptions, []string, error) {
 		options.exclude = append(options.exclude, value)
 		return nil
 	})
+	flags.StringVar(&options.progress, "progress", "", "progress output: none, json, or text")
 	flags.Var(&boolFlag{target: &options.update, set: options.set, name: "update"}, "update", "incremental synchronization")
 	flags.Var(&boolFlag{target: &options.dryRun, set: options.set, name: "dry-run"}, "dry-run", "scan without transfer")
 	normalized, err := reorderFlags(args)
@@ -306,6 +340,139 @@ func (flag *boolFlag) IsBoolFlag() bool {
 	return true
 }
 
+const (
+	progressNone = "none"
+	progressJSON = "json"
+	progressText = "text"
+)
+
+func normalizeProgress(value string) (string, error) {
+	switch value {
+	case "", progressNone:
+		return progressNone, nil
+	case progressJSON, progressText:
+		return value, nil
+	default:
+		return "", fmt.Errorf("invalid --progress %q (want %s, %s, or %s)", value, progressNone, progressJSON, progressText)
+	}
+}
+
+// requestedProgressFormat scans raw arguments before flag parsing so that
+// command-line errors can still be reported in the requested format. It returns
+// only json or text; anything else (including an invalid value) yields "none"
+// and therefore the human-readable error path.
+func requestedProgressFormat(args []string) string {
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		if argument == "--progress" && index+1 < len(args) {
+			format, err := normalizeProgress(args[index+1])
+			if err == nil {
+				if format == progressJSON || format == progressText {
+					return format
+				}
+				return progressNone
+			}
+			return progressNone
+		}
+		if strings.HasPrefix(argument, "--progress=") {
+			format, err := normalizeProgress(strings.TrimPrefix(argument, "--progress="))
+			if err == nil {
+				if format == progressJSON || format == progressText {
+					return format
+				}
+				return progressNone
+			}
+			return progressNone
+		}
+	}
+	return progressNone
+}
+
+// progressOutput serializes progress events for the calling program. JSON mode
+// writes newline-delimited JSON; text mode renders a single carriage-return
+// status line. A mutex keeps output well-formed because transfers may report
+// from multiple goroutines.
+type progressOutput struct {
+	mu      sync.Mutex
+	format  string
+	output  io.Writer
+	encoder *json.Encoder
+	lastLen int
+}
+
+func newProgressOutput(format string, output io.Writer) *progressOutput {
+	writer := &progressOutput{format: format, output: output}
+	if format == progressJSON {
+		writer.encoder = json.NewEncoder(output)
+	}
+	return writer
+}
+
+func (writer *progressOutput) Enabled() bool {
+	return writer != nil && writer.format != "" && writer.format != progressNone
+}
+
+func (writer *progressOutput) Sink() progress.Sink {
+	if !writer.Enabled() {
+		return nil
+	}
+	return writer.emit
+}
+
+func (writer *progressOutput) emitError(err error) {
+	writer.emit(progress.Event{Phase: progress.PhaseError, Error: err.Error()})
+}
+
+func (writer *progressOutput) emit(event progress.Event) {
+	event.Version = progress.SchemaVersion
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	switch writer.format {
+	case progressJSON:
+		_ = writer.encoder.Encode(event)
+	case progressText:
+		line := formatProgress(event)
+		padding := ""
+		if len(line) < writer.lastLen {
+			padding = strings.Repeat(" ", writer.lastLen-len(line))
+		}
+		fmt.Fprintf(writer.output, "\r%s%s", line, padding)
+		writer.lastLen = len(line)
+		if event.Phase == progress.PhaseDone || event.Phase == progress.PhaseError {
+			fmt.Fprintln(writer.output)
+			writer.lastLen = 0
+		}
+	}
+}
+
+func formatProgress(event progress.Event) string {
+	switch event.Phase {
+	case progress.PhaseError:
+		return "error: " + event.Error
+	case progress.PhaseDone:
+		return fmt.Sprintf("done: files=%d bytes=%d skipped=%d", event.FilesDone, event.BytesDone, event.Skipped)
+	}
+	prefix := string(event.Phase)
+	if event.FilesTotal > 0 {
+		percent := float64(event.FilesDone) / float64(event.FilesTotal) * 100
+		return fmt.Sprintf("%s: %d/%d files  %s/%s  %.0f%%", prefix, event.FilesDone, event.FilesTotal, humanBytes(event.BytesDone), humanBytes(event.BytesTotal), percent)
+	}
+	return fmt.Sprintf("%s: %d files  %s", prefix, event.FilesDone, humanBytes(event.BytesDone))
+}
+
+func humanBytes(value int64) string {
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	divisor, exponent := int64(unit), 0
+	for n := value / unit; n >= unit; n /= unit {
+		divisor *= unit
+		exponent++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(value)/float64(divisor), "KMGTPE"[exponent])
+}
+
 func resolve(options cliOptions) (config.Project, error) {
 	project := config.Project{}
 	if options.configPath != "" {
@@ -351,22 +518,22 @@ func address(project config.Project) string {
 	return net.JoinHostPort(project.Host, strconv.Itoa(project.Port))
 }
 
-func listen(project config.Project) error {
+func listen(project config.Project, sink progress.Sink) error {
 	listener, err := transfer.Listen(transfer.ReceiveOptions{Address: address(project)})
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	result, err := transfer.Receive(listener, transfer.ReceiveOptions{Destination: project.Destination, Update: project.Update})
+	result, err := transfer.Receive(listener, transfer.ReceiveOptions{Destination: project.Destination, Update: project.Update, Progress: sink})
 	if err == nil {
 		fmt.Printf("files=%d bytes=%d\n", result.Files, result.Bytes)
 	}
 	return err
 }
 
-func pull(project config.Project, dryRun bool) error {
+func pull(project config.Project, dryRun bool, output *progressOutput) error {
 	if dryRun {
-		result, err := transfer.Send(transfer.SendOptions{Source: project.Source, Workers: project.Workers, Include: project.Include, Exclude: project.Exclude, Update: project.Update, DryRun: true})
+		result, err := transfer.Send(transfer.SendOptions{Source: project.Source, Workers: project.Workers, Include: project.Include, Exclude: project.Exclude, Update: project.Update, DryRun: true, Progress: output.Sink()})
 		if err == nil {
 			fmt.Println(result.String())
 		}
@@ -404,8 +571,7 @@ func pull(project config.Project, dryRun bool) error {
 	}
 	command := exec.Command(sender, arguments...)
 	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	sendErr := command.Run()
+	sendErr := runSender(command, output)
 	if sendErr != nil {
 		listener.Close()
 	}
@@ -414,6 +580,73 @@ func pull(project config.Project, dryRun bool) error {
 		return fmt.Errorf("run Windows sender: %w", sendErr)
 	}
 	return receiveErr
+}
+
+// maxSenderDiagnostics bounds how much non-event sender output is folded into
+// a failure message so that stderr stays pure JSON without accumulating
+// unbounded diagnostics.
+const maxSenderDiagnostics = 10
+
+// runSender starts the Windows sender and forwards its structured progress.
+// When progress is enabled the sender writes newline-delimited JSON to stderr.
+// Non-event lines and the sender's own error event are kept out of the JSON
+// stream; the most recent diagnostics are attached to a returned error so a
+// failure still carries context.
+func runSender(command *exec.Cmd, output *progressOutput) error {
+	if !output.Enabled() {
+		command.Stderr = os.Stderr
+		return command.Run()
+	}
+	command.Args = append(command.Args, "--progress=json")
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := command.Start(); err != nil {
+		return err
+	}
+	diagnostics := forwardSenderProgress(stderr, output)
+	if err := command.Wait(); err != nil {
+		if diagnostics != "" {
+			return fmt.Errorf("%w: %s", err, diagnostics)
+		}
+		return err
+	}
+	return nil
+}
+
+// forwardSenderProgress forwards sender events and returns buffered
+// diagnostics. Events are re-emitted in the caller's format; the sender's
+// terminal error event is dropped because the top-level command owns the single
+// error event. Lines that are not events are not written to the output streams.
+func forwardSenderProgress(reader io.Reader, output *progressOutput) string {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	var diagnostics []string
+	appendDiagnostic := func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return
+		}
+		diagnostics = append(diagnostics, line)
+		if len(diagnostics) > maxSenderDiagnostics {
+			diagnostics = diagnostics[len(diagnostics)-maxSenderDiagnostics:]
+		}
+	}
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var event progress.Event
+		if len(line) > 0 && line[0] == '{' && json.Unmarshal(line, &event) == nil && event.Phase != "" {
+			if event.Phase == progress.PhaseError {
+				appendDiagnostic(event.Error)
+				continue
+			}
+			output.emit(event)
+			continue
+		}
+		appendDiagnostic(string(line))
+	}
+	return strings.Join(diagnostics, "; ")
 }
 
 func findWindowsSender() (string, error) {

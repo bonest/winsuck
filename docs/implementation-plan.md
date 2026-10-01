@@ -27,6 +27,24 @@ reads source files through `/mnt/c`.
 5. WSL extracts the TAR stream directly to the ext4 destination and writes an
    updated manifest only after a successful transfer.
 
+## Progress Reporting
+
+- `--progress=json` makes each command emit newline-delimited JSON events on
+  stderr; `--progress=text` renders a single status line. The default is `none`,
+  so existing output and defaults are unchanged.
+- In `json` mode every stderr line is a JSON event. The CLI owns the single
+  terminal `error` event; the transfer layer emits `done` on success and returns
+  errors instead, so no duplicate or non-JSON line reaches the caller.
+- During `pull`, the Windows sender writes its events to stderr and the Linux
+  orchestrator forwards them, dropping non-event and error lines. No side
+  channel or protocol change is needed and the TAR data path is untouched.
+- The sender counts discovered files and bytes in its existing filter workers,
+  so `scanning` events stream immediately and exact totals become available
+  when the walk completes, without a second traversal or a temporary archive.
+- `SendOptions.Progress` and `ReceiveOptions.Progress` expose the same events to
+  in-process callers.
+- The full contract is documented in [`progress-protocol.md`](progress-protocol.md).
+
 ## Performance Design
 
 - Windows walks and opens source files natively.
@@ -55,4 +73,5 @@ reads source files through `/mnt/c`.
 2. Implement manual `listen` and `send` streaming.
 3. Implement `pull` WSL orchestration.
 4. Add manifest-backed update mode.
-5. Add focused unit and integration tests, then benchmark representative trees.
+5. Add structured progress events for status-bar callers.
+6. Add focused unit and integration tests, then benchmark representative trees.

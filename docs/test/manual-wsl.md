@@ -48,6 +48,22 @@ cat /tmp/winsuck-destination/Models/Example/Example.xpp
 test ! -e /tmp/winsuck-destination/Models/Example/bin/generated.dll && echo "exclude works"
 ```
 
+## Verify Progress Events
+
+Add `--progress=json` to stream status events on stderr while stdout keeps the
+final summary. Every stderr line is JSON, the Windows sender's events are
+relayed by `pull`, and the `transferring`/`done` phases include file and byte
+totals:
+
+```bash
+./winsuck pull 'C:\temp\winsuck-source' /tmp/winsuck-destination \
+  --exclude '**/bin/**' --progress=json 2>/tmp/winsuck-progress.ndjson
+cat /tmp/winsuck-progress.ndjson
+jq -e 'select(.phase=="done") | .files_total > 0' /tmp/winsuck-progress.ndjson
+```
+
+See [`../progress-protocol.md`](../progress-protocol.md) for the full contract.
+
 ## Run with a Project Profile
 
 Use the example profile in this directory as a starting point. Update its

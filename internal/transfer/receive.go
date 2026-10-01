@@ -8,12 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/bonest/winsuck/internal/progress"
 )
 
 type ReceiveOptions struct {
 	Destination string
 	Address     string
 	Update      bool
+	Progress    progress.Sink
 }
 
 type ReceiveResult struct {
@@ -25,7 +28,22 @@ func Listen(options ReceiveOptions) (net.Listener, error) {
 	return net.Listen("tcp", options.Address)
 }
 
-func Receive(listener net.Listener, options ReceiveOptions) (ReceiveResult, error) {
+func Receive(listener net.Listener, options ReceiveOptions) (result ReceiveResult, err error) {
+	reporter := progress.NewReporter(options.Progress)
+	reporter.Start()
+	defer func() {
+		if err != nil {
+			return
+		}
+		reporter.ReportNow(progress.Event{
+			Phase:      progress.PhaseDone,
+			FilesDone:  result.Files,
+			BytesDone:  result.Bytes,
+			FilesTotal: result.Files,
+			BytesTotal: result.Bytes,
+		})
+	}()
+
 	connection, err := listener.Accept()
 	if err != nil {
 		return ReceiveResult{}, fmt.Errorf("accept sender: %w", err)
@@ -45,7 +63,6 @@ func Receive(listener net.Listener, options ReceiveOptions) (ReceiveResult, erro
 		return ReceiveResult{}, fmt.Errorf("send receiver control: %w", err)
 	}
 
-	result := ReceiveResult{}
 	if !options.Update {
 		manifest = Manifest{}
 	}
@@ -101,6 +118,12 @@ func Receive(listener net.Listener, options ReceiveOptions) (ReceiveResult, erro
 		manifest[filepath.ToSlash(header.Name)] = FileState{Size: header.Size, MTime: header.ModTime.Unix()}
 		result.Files++
 		result.Bytes += written
+		reporter.Report(progress.Event{
+			Phase:     progress.PhaseExtracting,
+			FilesDone: result.Files,
+			BytesDone: result.Bytes,
+			Current:   header.Name,
+		})
 	}
 	if options.Update {
 		if err := WriteManifest(options.Destination, manifest); err != nil {

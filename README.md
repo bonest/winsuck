@@ -62,6 +62,33 @@ All commands accept `--port`; it defaults to `9099`. `--include` and
 `--exclude` are repeatable glob flags. Includes select files, excludes always
 win, and a source-root `.winsuckignore` adds excludes.
 
+## Progress Feedback
+
+Pass `--progress=json` (or `--progress=text`) to emit transfer progress on
+stderr while stdout keeps the final `files=… bytes=…` summary. The default,
+`--progress=none`, preserves the original quiet behavior. In JSON mode every
+stderr line is a newline-delimited JSON event, including a single terminal
+`error` event on failure.
+
+```json
+{"v":1,"phase":"scanning","files_done":1200,"bytes_done":52428800,"elapsed_ms":830}
+{"v":1,"phase":"transferring","files_done":4200,"files_total":358000,"bytes_done":734003200,"bytes_total":21474836480,"current":"Models/Example.xpp"}
+{"v":1,"phase":"done","files_done":358000,"files_total":358000,"bytes_done":21474836480,"bytes_total":21474836480,"skipped":12,"elapsed_ms":154000}
+```
+
+A calling program reads stderr, applies events in order, and stops on `done` or
+`error`:
+
+```bash
+winsuck pull "C:\src" ~/cache --progress=json 2> >(while read -r line; do
+  echo "$line" | jq -r '"\(.phase) \(.files_done)/\(.files_total)"'
+done)
+```
+
+See [`docs/progress-protocol.md`](docs/progress-protocol.md) for the complete
+contract: field reference, phase lifecycles, totals semantics, parsing rules,
+and Bash/Python/Go examples.
+
 ## Project Configuration
 
 Pass a JSON profile with `--config`:
